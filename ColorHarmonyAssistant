@@ -1,0 +1,914 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Interior Color Harmony Assistant (PyQt6)
+- style.json 読み込み→スタイル別に学習（RF/LGBM）
+- 抽出/調和パラメータ、重みの自動学習（LogReg）
+- 評価：詳細タブでテキスト/プレビュー/ギャップ棒グラフ/カラーパレット
+- 画像プレビュー：ズーム/原寸/フィット/外部ポップアウト
+- NEW: パレット可視化（抽出色チップ＋比率表示）
+- NEW: スタイルに近づける提案サマリーを詳細レポート末尾に自動追加
+- NEW: 詳細タブを QSplitter（縦）で分割（上：テキスト／中：プレビュー／下：グラフ）
+"""
+
+import os, sys, json, glob
+from collections import Counter
+from functools import reduce
+import numpy as np
+import pandas as pd
+import cv2
+
+from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread
+
+import matplotlib
+matplotlib.use("QtAgg")
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
+
+from sklearn.cluster import KMeans
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from kneed import KneeLocator
+
+try:
+    import lightgbm as lgb
+    _HAS_LGB = True
+except Exception:
+    _HAS_LGB = False
+
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+
+HARM_KEYS = ["Complementary", "Analogous", "Monochromatic", "SplitComplementary", "Triadic"]
+
+# ---------------- Core: Palette extraction & Harmony ----------------
+
+class PaletteExtractor:
+    def __init__(self, num_colors=5, auto_k=False, resize_wh=(600, 400), max_samples=50000, rng_seed=42):
+        self.num_colors=int(num_colors); self.auto_k=bool(auto_k)
+        self.resize_wh=tuple(resize_wh); self.max_samples=int(max_samples)
+        self.rng = np.random.default_rng(rng_seed)
+
+    @staticmethod
+    def _determine_optimal_clusters(pixel_data, k_min=1, k_max=10):
+        distortions=[]; K=range(k_min, k_max+1)
+        for k in K:
+            kmeans = KMeans(n_clusters=k, n_init='auto', random_state=0)
+            kmeans.fit(pixel_data); distortions.append(kmeans.inertia_)
+        kn = KneeLocator(list(K), distortions, curve='convex', direction='decreasing')
+        return kn.knee or min(5, k_max)
+
+    @staticmethod
+    def _rgb_list_to_hsv_list(colors_rgb):
+        out=[]
+        for rgb in colors_rgb:
+            arr=np.uint8([[rgb]]); hsv=cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)[0][0]
+            out.append(hsv.tolist())
+        return out
+
+    def extract_palette_from_image(self, image_path):
+        bgr=cv2.imread(image_path)
+        if bgr is None: raise FileNotFoundError(f"画像が読めません: {image_path}")
+        rgb_full=cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+        w,h=self.resize_wh
+        rgb_small=cv2.resize(rgb_full,(w,h),interpolation=cv2.INTER_AREA)
+        pixels=rgb_small.reshape((-1,3)).astype(np.float32)
+
+        sample=pixels
+        if len(pixels)>self.max_samples:
+            idx=self.rng.choice(len(pixels),size=self.max_samples,replace=False); sample=pixels[idx]
+
+        k=self._determine_optimal_clusters(sample) if self.auto_k else self.num_colors
+        kmeans=KMeans(n_clusters=k, n_init='auto', random_state=0).fit(sample)
+        centers=kmeans.cluster_centers_.astype(int)
+
+        labels_full=kmeans.predict(pixels)
+        counts_map=Counter(labels_full)
+        ordered=[i for i,_ in counts_map.most_common()]
+        colors_rgb=[centers[i].tolist() for i in ordered]
+        counts=[counts_map[i] for i in ordered]
+        colors_hsv=self._rgb_list_to_hsv_list(colors_rgb)
+
+        total=sum(counts)
+        df_palette=pd.DataFrame({
+            'R':[c[0] for c in colors_rgb],
+            'G':[c[1] for c in colors_rgb],
+            'B':[c[2] for c in colors_rgb],
+            'H':[c[0] for c in colors_hsv],
+            'S':[c[1] for c in colors_hsv],
+            'V':[c[2] for c in colors_hsv],
+            'Count':counts,
+            'Ratio':[cnt/total for cnt in counts],
+        })
+        return {'palette_rgb':colors_rgb,'palette_hsv':colors_hsv,'counts':counts,'palette_df':df_palette}
+
+class HarmonyEvaluator:
+    def __init__(self, weights=None, hue_max=180):
+        self.weights = weights or {'Complementary':1.2,'Analogous':1.0,'Monochromatic':0.9,'SplitComplementary':1.0,'Triadic':1.1}
+        self.hue_max=int(hue_max)
+
+    def _hue_circ_dist(self,h1,h2):
+        d=abs(h1-h2); return min(d, self.hue_max-d)
+    def _complementary_score(self,c1,c2):
+        dh=self._hue_circ_dist(c1[0],c2[0]); return 1-abs(dh-180)/180.0
+    def _analogous_score(self,c1,c2,tol=30):
+        dh=self._hue_circ_dist(c1[0],c2[0]); return max(0.0,1.0-dh/tol)
+    def _monochromatic_score(self,c1,c2,hue_tol=30):
+        dh=self._hue_circ_dist(c1[0],c2[0])/hue_tol; hue_term=max(0.0,1.0-dh)
+        ds=abs(c1[1]-c2[1])/255.0; dv=abs(c1[2]-c2[2])/255.0; sv=1.0-(ds+dv)/2.0
+        return max(0.0,0.6*hue_term+0.4*sv)
+    def _triadic_score3(self,c1,c2,c3):
+        def tri(a,b): dh=self._hue_circ_dist(a[0],b[0]); return 1.0-abs(dh-120)/120.0
+        return (tri(c1,c2)+tri(c1,c3))/2.0
+    def _split_complementary_score3(self,c1,c2,c3):
+        return (self._complementary_score(c1,c2)+self._analogous_score(c2,c3))/2.0
+
+    def evaluate(self,hsv_colors,image_name="(unknown)"):
+        n=len(hsv_colors)
+        bucket={k:[] for k in HARM_KEYS}
+        for i in range(n):
+            for j in range(i+1,n):
+                c1,c2=hsv_colors[i],hsv_colors[j]
+                bucket['Complementary'].append(self._complementary_score(c1,c2))
+                bucket['Analogous'].append(self._analogous_score(c1,c2))
+                bucket['Monochromatic'].append(self._monochromatic_score(c1,c2))
+        for i in range(n):
+            for j in range(i+1,n):
+                for k in range(j+1,n):
+                    c1,c2,c3=hsv_colors[i],hsv_colors[j],hsv_colors[k]
+                    bucket['SplitComplementary'].append(self._split_complementary_score3(c1,c2,c3))
+                    bucket['Triadic'].append(self._triadic_score3(c1,c2,c3))
+        avg={k:(float(np.mean(v)) if v else 0.0) for k,v in bucket.items()}
+        total_w=sum(self.weights.values()); wsum=sum(avg[k]*self.weights[k] for k in self.weights)
+        avg['WeightedOverall']=wsum/total_w if total_w else 0.0
+        return avg, pd.DataFrame([{'Image_Name':image_name,**avg}])
+
+class FeatureBuilder:
+    def __init__(self, pe:PaletteExtractor, he:HarmonyEvaluator):
+        self.pe=pe; self.he=he
+
+    @staticmethod
+    def _list_images(folder):
+        exts=('*.jpg','*.jpeg','*.png','*.bmp','*.webp'); files=[]
+        for e in exts: files.extend(glob.glob(os.path.join(folder,e)))
+        return files
+
+    @staticmethod
+    def _color_stats_from_palette_df(df1:pd.DataFrame):
+        dom=df1.loc[df1['Ratio'].idxmax()]
+        Dom_H=float(dom['H']);Dom_S=float(dom['S']);Dom_V=float(dom['V']);Dom_Ratio=float(dom['Ratio'])
+        w=df1['Ratio'].values; H=df1['H'].values.astype(float); S=df1['S'].values.astype(float); V=df1['V'].values.astype(float)
+        Mean_H=float(np.sum(H*w)/np.sum(w)); Mean_S=float(np.sum(S*w)/np.sum(w)); Mean_V=float(np.sum(V*w)/np.sum(w))
+        return {'Dom_H':Dom_H,'Dom_S':Dom_S,'Dom_V':Dom_V,'Dom_Ratio':Dom_Ratio,'Mean_H':Mean_H,'Mean_S':Mean_S,'Mean_V':Mean_V}
+
+    def build_feature_table(self, folder, progress_cb=None, cancel_flag=None):
+        rows=[]; paths=self._list_images(folder); total=len(paths)
+        for i,p in enumerate(paths,1):
+            if cancel_flag and cancel_flag(): break
+            name=os.path.basename(p)
+            if progress_cb: progress_cb(f"{os.path.basename(folder)}: {name} ({i}/{total})")
+            res=self.pe.extract_palette_from_image(p)
+            _,score_df=self.he.evaluate(res['palette_hsv'], image_name=name)
+            stats=self._color_stats_from_palette_df(res['palette_df'])
+            row=score_df.copy()
+            for k,v in stats.items(): row[k]=v
+            rows.append(row)
+        return pd.concat(rows,ignore_index=True) if rows else pd.DataFrame()
+
+# -------------- Weight learning & style.json ----------------
+
+def learn_weights_from_scores(df_pos, df_neg):
+    train=pd.concat([df_pos.assign(is_typical=1), df_neg.assign(is_typical=0)], ignore_index=True)
+    if train.empty or len(train)<3:
+        w=np.ones(len(HARM_KEYS)); w=w/w.sum(); return dict(zip(HARM_KEYS,w))
+    X=train[HARM_KEYS].values; y=train["is_typical"].values
+    lr=LogisticRegression(penalty="l2", C=1.0, max_iter=1000, solver="lbfgs").fit(X,y)
+    coef=np.clip(lr.coef_[0],0,None); w=coef if coef.sum()>0 else np.ones_like(coef)
+    w=w/w.sum(); return dict(zip(HARM_KEYS,w))
+
+def apply_weights_overall(df:pd.DataFrame, wdict:dict):
+    df=df.copy(); W=np.array([wdict[k] for k in HARM_KEYS], dtype=float)
+    df["WeightedOverall"]=df[HARM_KEYS].values @ W
+    return df
+
+_VALID_IMG_EXTS=(".jpg",".jpeg",".png",".bmp",".webp")
+
+def _has_images(folder):
+    if not os.path.isdir(folder): return False
+    for ext in _VALID_IMG_EXTS:
+        if glob.glob(os.path.join(folder,f"*{ext}")): return True
+    return False
+
+def load_styles_from_json(json_path, base_dir="."):
+    with open(json_path,"r",encoding="utf-8") as f: data=json.load(f)
+    norm=[]
+    if isinstance(data,dict):
+        for name,spec in data.items():
+            if not (isinstance(spec,dict) and "positive" in spec and "negative" in spec):
+                raise ValueError(f"JSON形式が不正: key='{name}' に 'positive'/'negative' が必要です。")
+            norm.append({"name":name,"positive":spec["positive"],"negative":spec["negative"]})
+    elif isinstance(data,list):
+        for i,it in enumerate(data):
+            if not (isinstance(it,dict) and all(k in it for k in ("name","positive","negative"))):
+                raise ValueError(f"JSON形式が不正: index={i} に 'name'/'positive'/'negative' が必要です。")
+            norm.append(it)
+    else:
+        raise ValueError("JSONルートはオブジェクトまたは配列にしてください。")
+
+    def _abs(p):
+        p=os.path.expanduser(p)
+        if not os.path.isabs(p): p=os.path.abspath(os.path.join(base_dir,p))
+        return p
+
+    styles={}; errors=[]
+    for e in norm:
+        name=str(e["name"]); pos=_abs(e["positive"]); neg=_abs(e["negative"])
+        if not os.path.isdir(pos): errors.append(f"[{name}] positiveフォルダが存在しません: {pos}")
+        if not os.path.isdir(neg): errors.append(f"[{name}] negativeフォルダが存在しません: {neg}")
+        if os.path.isdir(pos) and not _has_images(pos): errors.append(f"[{name}] positiveフォルダに画像がありません: {pos}")
+        if os.path.isdir(neg) and not _has_images(neg): errors.append(f"[{name}] negativeフォルダに画像がありません: {neg}")
+        styles[name]=(pos,neg)
+    if errors: raise FileNotFoundError("style.json 検証エラー:\n- "+"\n- ".join(errors))
+    return styles
+
+# -------------- Plot helpers ----------------
+
+def _signed_colors(vals, pos_color='#d62728', neg_color='#1f77b4', zero_color='#aaaaaa'):
+    return [pos_color if v>0 else (neg_color if v<0 else zero_color) for v in vals]
+
+def draw_signed_bar(canvas:FigureCanvasQTAgg, labels, values, title=None, xlabel=None):
+    canvas.figure.clf(); ax=canvas.figure.add_subplot(111)
+    vals=list(values); labs=list(labels)
+    max_abs=max(1e-9, max(abs(v) for v in vals)); lim=max_abs*1.15
+    ax.barh(np.arange(len(labs)), vals, color=_signed_colors(vals), edgecolor='none')
+    ax.axvline(0,color='#666',lw=1); ax.set_xlim(-lim,lim)
+    ax.set_yticks(range(len(labs))); ax.set_yticklabels(labs)
+    ax.set_xlabel(xlabel or "Gap (current - typical mean)")
+    if title: ax.set_title(title)
+    ax.tick_params(labelsize=9)
+    for yi,v in enumerate(vals):
+        ax.text(v+(0.02*lim if v>=0 else -0.02*lim), yi, f"{v:+.3f}",
+                va='center', ha='left' if v>=0 else 'right', fontsize=9)
+    canvas.figure.tight_layout(); canvas.draw()
+
+# -------------- Workers ----------------
+
+class TrainWorkerWithParams(QObject):
+    progressed=pyqtSignal(str); finished=pyqtSignal(dict,dict); failed=pyqtSignal(str)
+    def __init__(self, styles, feature_builder, model_type, rf_params, lgbm_params, cancel_flag, auto_learn_weights, ui_weights):
+        super().__init__()
+        self.styles=styles; self.feature_builder=feature_builder
+        self.model_type=model_type; self.rf_params=rf_params or {}
+        self.lgbm_params=lgbm_params or {}; self.cancel_flag=cancel_flag
+        self.auto_learn_weights=auto_learn_weights; self.ui_weights=ui_weights
+
+    def _progress(self,msg): self.progressed.emit(msg)
+    def _canceled(self): return self.cancel_flag() if self.cancel_flag else False
+
+    def run(self):
+        try:
+            models={}; protos={}
+            for style,(pos_dir,neg_dir) in self.styles.items():
+                if self._canceled(): break
+                self._progress(f"学習: {style}（正:{os.path.basename(pos_dir)} / 負:{os.path.basename(neg_dir)}）")
+                pos_df=self.feature_builder.build_feature_table(pos_dir, progress_cb=self._progress, cancel_flag=self._canceled)
+                if self._canceled(): break
+                neg_df=self.feature_builder.build_feature_table(neg_dir, progress_cb=self._progress, cancel_flag=self._canceled)
+                if self._canceled(): break
+
+                learned_w=None
+                if self.auto_learn_weights:
+                    learned_w=learn_weights_from_scores(pos_df,neg_df)
+                    pos_df=apply_weights_overall(pos_df, learned_w)
+                    neg_df=apply_weights_overall(neg_df, learned_w)
+                    self._progress("  学習重み: " + ", ".join(f"{k}={learned_w[k]:.3f}" for k in HARM_KEYS))
+
+                clf=RoomStyleClassifierWithParams(self.model_type, self.rf_params, self.lgbm_params)
+                clf.learned_weights=learned_w
+                clf.fit(pos_df,neg_df)
+                models[style]=clf; protos[style]=clf.prototype_mean_
+                self._progress(f"完了: {style} (pos={len(pos_df)}, neg={len(neg_df)})")
+            self.finished.emit(models, protos)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+class EvaluateWorker(QObject):
+    progressed=pyqtSignal(str); finished=pyqtSignal(dict,object); failed=pyqtSignal(str)
+    def __init__(self, models, feature_builder, eval_folder, cancel_flag, ui_weights):
+        super().__init__()
+        self.models=models; self.feature_builder=feature_builder
+        self.eval_folder=eval_folder; self.cancel_flag=cancel_flag; self.ui_weights=ui_weights
+    def _progress(self,msg): self.progressed.emit(msg)
+    def _canceled(self): return self.cancel_flag() if self.cancel_flag else False
+    def run(self):
+        try:
+            per_style={}; over=[]
+            for i,(style,clf) in enumerate(self.models.items(),1):
+                if self._canceled(): break
+                self._progress(f"評価({i}/{len(self.models)}): {style}")
+                scored=clf.predict_proba_for_folder(self.eval_folder, self.feature_builder,
+                                                    progress_cb=self._progress, cancel_flag=self._canceled)
+                if self._canceled(): break
+                if getattr(clf,"learned_weights",None) is not None:
+                    scored=apply_weights_overall(scored, clf.learned_weights)
+                gap=clf.analyze_gaps(scored); per_style[style]=gap
+                slim=gap[['Image_Name','Typical_Likeness']].copy().rename(columns={'Typical_Likeness':f'{style}_likeness'})
+                over.append(slim)
+            overview=reduce(lambda L,R: L.merge(R,on='Image_Name',how='outer'), over) if over else pd.DataFrame(columns=['Image_Name'])
+            self.finished.emit(per_style, overview)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+# -------------- Classifier ----------------
+
+class RoomStyleClassifierWithParams:
+    def __init__(self, model_type='rf', rf_params=None, lgbm_params=None, random_state=42):
+        self.model_type=model_type; self.random_state=random_state
+        self.model=None; self.rf_params=rf_params or {}; self.lgbm_params=lgbm_params or {}
+        self.learned_weights=None
+        self.feature_cols=['Complementary','Analogous','Monochromatic','SplitComplementary','Triadic','WeightedOverall',
+                           'Dom_H','Dom_S','Dom_V','Dom_Ratio','Mean_H','Mean_S','Mean_V']
+        self.prototype_mean_=None
+
+    def fit(self, typical_df, untypical_df):
+        if typical_df.empty or untypical_df.empty: raise ValueError("学習用データが空です。")
+        typ=typical_df.copy(); typ["is_typical"]=1
+        untyp=untypical_df.copy(); untyp["is_typical"]=0
+        train=pd.concat([typ,untyp],ignore_index=True)
+        X=train[self.feature_cols]; y=train["is_typical"]
+        self.prototype_mean_=typ[self.feature_cols].mean()
+
+        if self.model_type=='rf':
+            params={"n_estimators":200,"random_state":self.random_state,"n_jobs":-1}; params.update(self.rf_params)
+            self.model=RandomForestClassifier(**params).fit(X,y)
+        elif self.model_type=='lgbm':
+            if not _HAS_LGB: raise ImportError("lightgbm が見つかりません。")
+            params={"n_estimators":400,"learning_rate":0.05,"max_depth":4,"num_leaves":15,"min_child_samples":2,
+                    "min_child_weight":1e-3,"min_split_gain":0.0,"subsample":0.8,"colsample_bytree":0.8,
+                    "reg_lambda":0.1,"random_state":self.random_state,"is_unbalance":True}
+            params.update(self.lgbm_params); self.model=lgb.LGBMClassifier(**params).fit(X,y)
+        else: raise ValueError("model_type は 'rf' or 'lgbm'")
+
+    def predict_proba_for_folder(self, folder, fb:FeatureBuilder, progress_cb=None, cancel_flag=None):
+        df=fb.build_feature_table(folder, progress_cb=progress_cb, cancel_flag=cancel_flag)
+        if df.empty: return pd.DataFrame()
+        proba=self.model.predict_proba(df[self.feature_cols])[:,1] if hasattr(self.model,"predict_proba") else self.model.predict(df[self.feature_cols])
+        out=df.copy(); out["Typical_Likeness"]=proba; return out
+
+    def analyze_gaps(self, scored_df):
+        if self.prototype_mean_ is None: raise RuntimeError("fit() を先に呼んでください。")
+        gap=scored_df.copy()
+        for col in self.feature_cols:
+            gap[f"Gap_{col}"]=gap[col]-self.prototype_mean_[col]
+        texts=[]
+        for _,r in gap.iterrows():
+            lines=[]
+            lines.append(f"全体(WeightedOverall)平均との差: {r['Gap_WeightedOverall']:+.3f} (+は調和的)")
+            for m in ['Analogous','Monochromatic','Complementary','SplitComplementary','Triadic']:
+                d=r[f"Gap_{m}"]; tag="不足傾向" if d<-0.05 else ("強め" if d>0.05 else "ほぼ平均")
+                lines.append(f"- {m}: {d:+.3f} → {tag}")
+            lines.append("支配色(Dom HSV)差分: "
+                         f"H:{r['Gap_Dom_H']:+.1f}, S:{r['Gap_Dom_S']:+.1f}, V:{r['Gap_Dom_V']:+.1f}, "
+                         f"支配割合:{r['Gap_Dom_Ratio']:+.3f}")
+            lines.append("平均色(Mean HSV)差分: "
+                         f"H:{r['Gap_Mean_H']:+.1f}, S:{r['Gap_Mean_S']:+.1f}, V:{r['Gap_Mean_V']:+.1f}")
+            lines.append(f"→ このスタイルらしさ: {r['Typical_Likeness']:.3f}")
+            texts.append("\n".join(lines))
+        gap["AnalysisText"]=texts
+        return gap
+
+# -------------- Hue helpers & recommendations ----------------
+
+def hue_name(h):
+    bins=[0,10,25,45,75,105,135,165,180]
+    names=["赤","橙","黄","緑","青緑","青","紫","赤寄り紫"]
+    for i in range(len(bins)-1):
+        if bins[i]<=h<bins[i+1]: return names[i]
+    return "色相"
+
+def circ_delta(src, dst, hue_max=180):
+    diff = (dst - src) % hue_max
+    if diff>hue_max/2: diff -= hue_max
+    return diff
+
+def build_recommendation(row, proto_mean):
+    lines=[]
+    deficits=[]
+    for m in ["Analogous","Monochromatic","Complementary","SplitComplementary","Triadic","WeightedOverall"]:
+        ds=row[f"Gap_{m}"]; deficits.append((m, ds))
+    deficits.sort(key=lambda x: x[1])
+    key_tips={
+        "Analogous":"近接色（類似色）の比率を増やす：主色の隣接色をアクセントや面積で追加",
+        "Monochromatic":"色相の散らばりを抑え、S/V(彩度・明度)の段階差を整える（同系の濃淡を使う）",
+        "Complementary":"補色ペアを明確に：主色の反対色を小面積アクセントで入れる",
+        "SplitComplementary":"補色を少しずらした2色を加え、主色との三角関係を作る",
+        "Triadic":"三角配色を意識し、3色のHue差が120°付近になるように配色する",
+        "WeightedOverall":"上記を1～2点に絞って改善（やり過ぎは禁物）"
+    }
+    weak=[f"- {m}: {ds:+.3f} → {key_tips[m]}" for m,ds in deficits if ds<-0.06]
+    if weak:
+        lines.append("【配色バランスの改善】")
+        lines.extend(weak)
+
+    domH=row['Dom_H']; meanH=row['Mean_H']
+    pdH=proto_mean['Dom_H']; pmH=proto_mean['Mean_H']
+    d_dom_h=circ_delta(domH, pdH); d_mean_h=circ_delta(meanH, pmH)
+    dir_str=lambda d: ("暖色側(+H)" if d>0 else "寒色側(-H)") if abs(d)>0.5 else "ほぼOK"
+
+    tips=[]
+    if abs(d_dom_h)>=1.0:
+        tips.append(f"支配色の色相を {abs(d_dom_h):.0f}° {dir_str(d_dom_h)} へ寄せる（例：{hue_name(domH)}→{hue_name(int((domH+d_dom_h)%180))}）")
+    if row['Gap_Dom_S']<-8: tips.append("支配色の彩度Sを上げて鮮やかさを出す（彩度が低い）")
+    if row['Gap_Dom_S']> 8: tips.append("支配色の彩度Sを少し下げ、落ち着きを出す（彩度が高い）")
+    if row['Gap_Dom_V']<-8: tips.append("支配色の明度Vを上げて明るさを確保する")
+    if row['Gap_Dom_V']> 8: tips.append("支配色の明度Vを少し下げて締まりを出す")
+    if row['Gap_Dom_Ratio']<-0.03: tips.append("主色の面積比（Dominant Ratio）を増やし、色の主従を明確化")
+    if row['Gap_Dom_Ratio']> 0.03: tips.append("主色の面積比をやや減らし、二次色の存在感を出す")
+    if abs(d_mean_h)>=1.0:
+        tips.append(f"全体平均の色相も {abs(d_mean_h):.0f}° {dir_str(d_mean_h)} に寄せる")
+    if row['Gap_Mean_S']<-8: tips.append("全体の彩度を+方向へ（差し色/テクスチャで鮮やかさ追加）")
+    if row['Gap_Mean_S']> 8: tips.append("全体の彩度を-方向へ（グレイッシュな素材/面積配分で調整）")
+    if row['Gap_Mean_V']<-8: tips.append("全体の明度を上げる（壁・天井・大型面積を明るい色へ）")
+    if row['Gap_Mean_V']> 8: tips.append("全体の明度を下げる（床・ファブリックでトーンダウン）")
+
+    if tips:
+        lines.append("【色（HSV）調整の具体案】"); lines.extend(f"- {t}" for t in tips)
+    if not (weak or tips):
+        lines.append("【提案】主要項目は概ね良好です。小さな要素の色数を抑える/面積比の微調整で最終仕上げを。")
+    return "\n".join(lines)
+
+# -------------- GUI: preview window ----------------
+
+class PreviewWindow(QtWidgets.QMainWindow):
+    def __init__(self,parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("外部プレビュー"); self.resize(900,700)
+        self._pix_orig=None; self._zoom=1.0; self._fit=True; self._current_path=""
+        central=QtWidgets.QWidget(self); self.setCentralWidget(central); v=QtWidgets.QVBoxLayout(central)
+        row=QtWidgets.QHBoxLayout()
+        self.chk_fit=QtWidgets.QCheckBox("Fit-to-Window"); self.chk_fit.setChecked(True); self.chk_fit.toggled.connect(self._on_toggle_fit)
+        self.slider=QtWidgets.QSlider(Qt.Orientation.Horizontal); self.slider.setRange(10,400); self.slider.setValue(100); self.slider.valueChanged.connect(self._on_slider)
+        self.lbl_zoom=QtWidgets.QLabel("100%"); self.lbl_zoom.setMinimumWidth(60)
+        self.btn_100=QtWidgets.QPushButton("原寸(100%)"); self.btn_100.clicked.connect(lambda: self.slider.setValue(100))
+        self.btn_full=QtWidgets.QPushButton("フルスクリーン"); self.btn_full.setCheckable(True); self.btn_full.toggled.connect(self._toggle_fullscreen)
+        for w in (self.chk_fit,self.slider,self.lbl_zoom,self.btn_100,self.btn_full): row.addWidget(w, 1 if w is self.slider else 0)
+        v.addLayout(row)
+        self.scroll=QtWidgets.QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.container=QtWidgets.QWidget(); self.scroll.setWidget(self.container); cl=QtWidgets.QVBoxLayout(self.container)
+        self.label=QtWidgets.QLabel("（画像なし）"); self.label.setAlignment(Qt.AlignmentFlag.AlignCenter); self.label.setScaledContents(False)
+        cl.addWidget(self.label); v.addWidget(self.scroll,1); self._update_ui_state()
+    def set_pixmap(self,pix,path=""): self._pix_orig=pix; self._current_path=path or ""; self._refresh()
+    def _on_toggle_fit(self,on): self._fit=bool(on); self._update_ui_state(); self._refresh()
+    def _on_slider(self,val): self._zoom=max(0.1,val/100.0); self.lbl_zoom.setText(f"{int(round(self._zoom*100))}%")
+    def _update_ui_state(self): self.slider.setEnabled(not self._fit); self.btn_100.setEnabled(not self._fit)
+    def _toggle_fullscreen(self,on): self.showFullScreen() if on else self.showNormal(); self.btn_full.setText("ウィンドウ表示" if on else "フルスクリーン")
+    def resizeEvent(self,e): super().resizeEvent(e)
+    def _refresh(self):
+        if self._pix_orig is None or self._pix_orig.isNull(): self.label.setPixmap(QtGui.QPixmap()); self.label.setText("（画像なし）"); return
+        if self._fit:
+            w=max(1,self.scroll.viewport().width()-4); h=max(1,self.scroll.viewport().height()-4)
+            target=self._pix_orig.scaled(w,h,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation)
+        else:
+            tw=max(1,int(self._pix_orig.width()*self._zoom)); th=max(1,int(self._pix_orig.height()*self._zoom))
+            target=self._pix_orig.scaled(tw,th,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation)
+        self.label.setPixmap(target); self.label.setToolTip(self._current_path)
+
+# -------------- GUI: main ----------------
+
+class MplCanvas(FigureCanvasQTAgg):
+    # 75% に縮小（4.5 x 2.25）
+    def __init__(self,width=4.5,height=2.25): super().__init__(Figure(figsize=(width,height), dpi=120))
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Interior Color Harmony Assistant"); self.resize(1280,860)
+
+        # state
+        self.styles={}; self.models={}; self.protos={}; self.per_style_results={}; self.overview_df=pd.DataFrame()
+        self.eval_folder=None; self.eval_image_index={}
+        self._img_pixmap_orig=None; self._img_zoom=1.0; self._img_fit=True; self._current_image_path=""
+        self._popout=None
+
+        # analysis components
+        self.palette_extractor=PaletteExtractor(num_colors=5, auto_k=False, resize_wh=(600,400), max_samples=50000)
+        self.harmony_evaluator=HarmonyEvaluator()
+        self.feature_builder=FeatureBuilder(self.palette_extractor, self.harmony_evaluator)
+
+        self._train_thread=None; self._eval_thread=None; self._cancel_requested=False
+
+        self._build_ui()
+
+    # ---- UI builders & helpers ----
+    def _hline(self):
+        line=QtWidgets.QFrame(); line.setFrameShape(QtWidgets.QFrame.Shape.HLine); line.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken); return line
+    def _wrap(self,layout):
+        w=QtWidgets.QWidget(); w.setLayout(layout); return w
+    def log(self,msg:str):
+        self.txt_log.appendPlainText(msg); self.statusBar().showMessage(msg)
+
+    def _build_ui(self):
+        central=QtWidgets.QWidget(self); self.setCentralWidget(central); layout=QtWidgets.QHBoxLayout(central)
+
+        # left pane
+        left=QtWidgets.QFrame(); left.setMaximumWidth(490); left.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+        v=QtWidgets.QVBoxLayout(left)
+        btn_load_json=QtWidgets.QPushButton("style.json を読み込む"); btn_load_json.clicked.connect(self.on_load_json); v.addWidget(btn_load_json)
+        self.lbl_json_path=QtWidgets.QLabel("未読込"); self.lbl_json_path.setWordWrap(True); v.addWidget(self.lbl_json_path)
+
+        tabs=QtWidgets.QTabWidget(); v.addWidget(tabs,1)
+        # 抽出/調和
+        tab_feat=QtWidgets.QWidget(); tabs.addTab(tab_feat,"抽出 / 調和"); tf=QtWidgets.QFormLayout(tab_feat)
+        self.spin_colors=QtWidgets.QSpinBox(); self.spin_colors.setRange(2,12); self.spin_colors.setValue(5)
+        self.chk_auto_k=QtWidgets.QCheckBox("自動k (エルボー法)")
+        self.spin_w=QtWidgets.QSpinBox(); self.spin_w.setRange(100,2400); self.spin_w.setValue(600)
+        self.spin_h=QtWidgets.QSpinBox(); self.spin_h.setRange(100,2400); self.spin_h.setValue(400)
+        self.spin_maxs=QtWidgets.QSpinBox(); self.spin_maxs.setRange(5000,200000); self.spin_maxs.setSingleStep(5000); self.spin_maxs.setValue(50000)
+        wh=QtWidgets.QHBoxLayout(); wh.addWidget(QtWidgets.QLabel("W:")); wh.addWidget(self.spin_w); wh.addWidget(QtWidgets.QLabel("H:")); wh.addWidget(self.spin_h)
+        tf.addRow("KMeans 色数:", self.spin_colors); tf.addRow("", self.chk_auto_k); tf.addRow("リサイズ:", self._wrap(wh)); tf.addRow("KMeans サンプル上限:", self.spin_maxs)
+        tf.addRow(self._hline())
+        self.chk_auto_weight=QtWidgets.QCheckBox("重みを自動学習（スタイル別）"); tf.addRow(self.chk_auto_weight)
+        self.spin_w_comp=QtWidgets.QDoubleSpinBox(); self.spin_w_comp.setRange(0,5); self.spin_w_comp.setSingleStep(0.1); self.spin_w_comp.setValue(1.2)
+        self.spin_w_anal=QtWidgets.QDoubleSpinBox(); self.spin_w_anal.setRange(0,5); self.spin_w_anal.setSingleStep(0.1); self.spin_w_anal.setValue(1.0)
+        self.spin_w_mono=QtWidgets.QDoubleSpinBox(); self.spin_w_mono.setRange(0,5); self.spin_w_mono.setSingleStep(0.1); self.spin_w_mono.setValue(0.9)
+        self.spin_w_split=QtWidgets.QDoubleSpinBox(); self.spin_w_split.setRange(0,5); self.spin_w_split.setSingleStep(0.1); self.spin_w_split.setValue(1.0)
+        self.spin_w_tria=QtWidgets.QDoubleSpinBox(); self.spin_w_tria.setRange(0,5); self.spin_w_tria.setSingleStep(0.1); self.spin_w_tria.setValue(1.1)
+        for lab, w in [("Complementary",self.spin_w_comp),("Analogous",self.spin_w_anal),("Monochromatic",self.spin_w_mono),("SplitComplementary",self.spin_w_split),("Triadic",self.spin_w_tria)]:
+            tf.addRow(f"重み {lab}:", w)
+        def _toggle():
+            en=not self.chk_auto_weight.isChecked()
+            for w in [self.spin_w_comp,self.spin_w_anal,self.spin_w_mono,self.spin_w_split,self.spin_w_tria]: w.setEnabled(en)
+        self.chk_auto_weight.stateChanged.connect(_toggle); _toggle()
+
+        # モデル
+        tab_model=QtWidgets.QWidget(); tabs.addTab(tab_model,"モデル"); fm=QtWidgets.QFormLayout(tab_model)
+        self.cmb_model=QtWidgets.QComboBox(); self.cmb_model.addItems(["RandomForest (推奨)"] + (["LightGBM"] if _HAS_LGB else [])); fm.addRow("分類器:", self.cmb_model)
+        self.grp_rf=QtWidgets.QGroupBox("RandomForest パラメータ"); rf=QtWidgets.QFormLayout(self.grp_rf)
+        self.rf_n_estimators=QtWidgets.QSpinBox(); self.rf_n_estimators.setRange(10,2000); self.rf_n_estimators.setValue(200)
+        self.rf_max_depth=QtWidgets.QSpinBox(); self.rf_max_depth.setRange(0,50); self.rf_max_depth.setValue(0)
+        self.rf_min_samples_split=QtWidgets.QSpinBox(); self.rf_min_samples_split.setRange(2,100); self.rf_min_samples_split.setValue(2)
+        self.rf_min_samples_leaf=QtWidgets.QSpinBox(); self.rf_min_samples_leaf.setRange(1,100); self.rf_min_samples_leaf.setValue(1)
+        rf.addRow("n_estimators:", self.rf_n_estimators); rf.addRow("max_depth(0=なし):", self.rf_max_depth)
+        rf.addRow("min_samples_split:", self.rf_min_samples_split); rf.addRow("min_samples_leaf:", self.rf_min_samples_leaf)
+        fm.addRow(self.grp_rf)
+        self.grp_lgb=QtWidgets.QGroupBox("LightGBM パラメータ"); lg=QtWidgets.QFormLayout(self.grp_lgb)
+        self.lgb_n_estimators=QtWidgets.QSpinBox(); self.lgb_n_estimators.setRange(10,5000); self.lgb_n_estimators.setValue(400)
+        self.lgb_lr=QtWidgets.QDoubleSpinBox(); self.lgb_lr.setRange(1e-4,1.0); self.lgb_lr.setSingleStep(0.01); self.lgb_lr.setDecimals(4); self.lgb_lr.setValue(0.05)
+        self.lgb_max_depth=QtWidgets.QSpinBox(); self.lgb_max_depth.setRange(-1,64); self.lgb_max_depth.setValue(4)
+        self.lgb_num_leaves=QtWidgets.QSpinBox(); self.lgb_num_leaves.setRange(2,256); self.lgb_num_leaves.setValue(15)
+        self.lgb_min_child_samples=QtWidgets.QSpinBox(); self.lgb_min_child_samples.setRange(1,200); self.lgb_min_child_samples.setValue(2)
+        self.lgb_min_child_weight=QtWidgets.QDoubleSpinBox(); self.lgb_min_child_weight.setRange(0.0,10.0); self.lgb_min_child_weight.setSingleStep(0.001); self.lgb_min_child_weight.setDecimals(4); self.lgb_min_child_weight.setValue(0.001)
+        self.lgb_min_split_gain=QtWidgets.QDoubleSpinBox(); self.lgb_min_split_gain.setRange(0.0,10.0); self.lgb_min_split_gain.setSingleStep(0.01); self.lgb_min_split_gain.setValue(0.0)
+        self.lgb_subsample=QtWidgets.QDoubleSpinBox(); self.lgb_subsample.setRange(0.1,1.0); self.lgb_subsample.setSingleStep(0.05); self.lgb_subsample.setValue(0.8)
+        self.lgb_colsample=QtWidgets.QDoubleSpinBox(); self.lgb_colsample.setRange(0.1,1.0); self.lgb_colsample.setSingleStep(0.05); self.lgb_colsample.setValue(0.8)
+        self.lgb_reg_lambda=QtWidgets.QDoubleSpinBox(); self.lgb_reg_lambda.setRange(0.0,10.0); self.lgb_reg_lambda.setSingleStep(0.1); self.lgb_reg_lambda.setValue(0.1)
+        self.lgb_unbalance=QtWidgets.QCheckBox("is_unbalance を有効化")
+        for lab,w in [("n_estimators:",self.lgb_n_estimators),("learning_rate:",self.lgb_lr),
+                      ("max_depth(-1=なし):",self.lgb_max_depth),("num_leaves:",self.lgb_num_leaves),
+                      ("min_child_samples:",self.lgb_min_child_samples),("min_child_weight:",self.lgb_min_child_weight),
+                      ("min_split_gain:",self.lgb_min_split_gain),("subsample:",self.lgb_subsample),
+                      ("colsample_bytree:",self.lgb_colsample),("reg_lambda:",self.lgb_reg_lambda)]:
+            lg.addRow(lab,w)
+        lg.addRow(self.lgb_unbalance); fm.addRow(self.grp_lgb)
+        def _toggle_groups():
+            use_lgb=self.cmb_model.currentText().startswith("LightGBM")
+            self.grp_lgb.setEnabled(use_lgb and _HAS_LGB); self.grp_rf.setEnabled(not use_lgb)
+        self.cmb_model.currentIndexChanged.connect(_toggle_groups); _toggle_groups()
+
+        v.addWidget(self._hline())
+        self.btn_train=QtWidgets.QPushButton("モデル学習（style.json 全スタイル）"); self.btn_train.clicked.connect(self.on_train); v.addWidget(self.btn_train)
+        self.btn_pick_eval=QtWidgets.QPushButton("評価フォルダを選択（evaluated_rooms）"); self.btn_pick_eval.clicked.connect(self.on_pick_eval); v.addWidget(self.btn_pick_eval)
+        self.lbl_eval=QtWidgets.QLabel("未選択"); self.lbl_eval.setWordWrap(True); v.addWidget(self.lbl_eval)
+        self.btn_eval=QtWidgets.QPushButton("評価を実行"); self.btn_eval.clicked.connect(self.on_evaluate); v.addWidget(self.btn_eval)
+
+        v.addSpacing(8); v.addWidget(self._hline())
+        self.cmb_style=QtWidgets.QComboBox(); self.cmb_style.currentIndexChanged.connect(self.on_style_changed)
+        v.addWidget(QtWidgets.QLabel("スタイル:")); v.addWidget(self.cmb_style)
+        self.list_images=QtWidgets.QListWidget(); self.list_images.itemSelectionChanged.connect(self.on_image_selected)
+        v.addWidget(QtWidgets.QLabel("画像:")); v.addWidget(self.list_images,1)
+        self.btn_save_png=QtWidgets.QPushButton("現在のギャップ図をPNG保存"); self.btn_save_png.clicked.connect(self.on_save_png); v.addWidget(self.btn_save_png)
+        v.addStretch(1); layout.addWidget(left)
+
+        # right (tabs)
+        right=QtWidgets.QTabWidget(); layout.addWidget(right,1)
+
+        # サマリータブ
+        self.tbl_overview=QtWidgets.QTableWidget(); self.tbl_overview.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_overview.setAlternatingRowColors(True); right.addTab(self.tbl_overview,"サマリー")
+
+        # 詳細タブ（QSplitter で構成）
+        detail=QtWidgets.QWidget(); right.addTab(detail,"詳細レポート")
+        dl=QtWidgets.QVBoxLayout(detail)
+
+        splitter = QtWidgets.QSplitter(Qt.Orientation.Vertical)
+        dl.addWidget(splitter)
+
+        # 上段：テキスト
+        self.txt_report=QtWidgets.QPlainTextEdit()
+        self.txt_report.setReadOnly(True)
+        self.txt_report.setMinimumHeight(220)  # 初期の最低値（調整可）
+        splitter.addWidget(self.txt_report)
+
+        # 中段：プレビュー＆パレット（1つの QWidget にまとめる）
+        img_page = QtWidgets.QWidget()
+        img_area_layout = QtWidgets.QVBoxLayout(img_page)
+
+        tool=QtWidgets.QHBoxLayout(); tool.addWidget(QtWidgets.QLabel("プレビュー:"))
+        self.chk_fit=QtWidgets.QCheckBox("Fit-to-Window"); self.chk_fit.setChecked(True); self.chk_fit.toggled.connect(self._on_toggle_fit)
+        self.zoom_slider=QtWidgets.QSlider(Qt.Orientation.Horizontal); self.zoom_slider.setRange(10,400); self.zoom_slider.setValue(100)
+        self.zoom_slider.setSingleStep(5); self.zoom_slider.setPageStep(10); self.zoom_slider.valueChanged.connect(self._on_zoom_slider)
+        self.lbl_zoom=QtWidgets.QLabel("100%"); self.lbl_zoom.setMinimumWidth(60)
+        self.btn_zoom_100=QtWidgets.QPushButton("原寸(100%)"); self.btn_zoom_100.clicked.connect(lambda: self.zoom_slider.setValue(100))
+        self.btn_popout=QtWidgets.QPushButton("外部プレビュー"); self.btn_popout.clicked.connect(self.on_popout)
+        for w in (self.chk_fit,self.zoom_slider,self.lbl_zoom,self.btn_zoom_100,self.btn_popout): tool.addWidget(w, 1 if w is self.zoom_slider else 0)
+        img_area_layout.addLayout(tool)
+
+        self.img_scroll=QtWidgets.QScrollArea(); self.img_scroll.setWidgetResizable(True)
+        self.img_container=QtWidgets.QWidget(); self.img_scroll.setWidget(self.img_container)
+        img_layout=QtWidgets.QVBoxLayout(self.img_container)
+        self.img_label=QtWidgets.QLabel("（ここに評価対象の画像プレビュー）"); self.img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.img_label.setScaledContents(False); img_layout.addWidget(self.img_label)
+        img_area_layout.addWidget(self.img_scroll,3)
+
+        palette_box=QtWidgets.QGroupBox("抽出カラーパレット（上：色チップ / 下：比率）")
+        pv=QtWidgets.QVBoxLayout(palette_box)
+        self.palette_colors_row=QtWidgets.QHBoxLayout()
+        self.palette_ratios_row=QtWidgets.QHBoxLayout()
+        pv.addLayout(self.palette_colors_row)
+        pv.addLayout(self.palette_ratios_row)
+        img_area_layout.addWidget(palette_box)
+
+        splitter.addWidget(img_page)
+
+        # 下段：グラフ（2枚を1コンテナにまとめる）
+        graph_container = QtWidgets.QWidget()
+        gvl = QtWidgets.QVBoxLayout(graph_container)
+        self.canvas_harmony=MplCanvas(width=4.5,height=2.25)
+        self.canvas_color  =MplCanvas(width=4.5,height=2.25)
+        gvl.addWidget(self.canvas_harmony)
+        gvl.addWidget(self.canvas_color)
+        splitter.addWidget(graph_container)
+
+        # 初期の比率（上:中:下）
+        splitter.setStretchFactor(0, 2)  # テキスト
+        splitter.setStretchFactor(1, 3)  # プレビュー
+        splitter.setStretchFactor(2, 2)  # グラフ
+
+        # ログタブ
+        self.txt_log=QtWidgets.QPlainTextEdit(); self.txt_log.setReadOnly(True); right.addTab(self.txt_log,"ログ")
+        self._update_preview_ui_state(); self.statusBar().showMessage("準備完了")
+
+    # ---- parameter getters ----
+    def get_harmony_weights(self):
+        return {'Complementary':self.spin_w_comp.value(),'Analogous':self.spin_w_anal.value(),
+                'Monochromatic':self.spin_w_mono.value(),'SplitComplementary':self.spin_w_split.value(),
+                'Triadic':self.spin_w_tria.value()}
+    def get_rf_params(self):
+        md=self.rf_max_depth.value()
+        return {"n_estimators":self.rf_n_estimators.value(),"max_depth":(None if md==0 else md),
+                "min_samples_split":self.rf_min_samples_split.value(),"min_samples_leaf":self.rf_min_samples_leaf.value()}
+    def get_lgbm_params(self):
+        return {"n_estimators":self.lgb_n_estimators.value(),"learning_rate":self.lgb_lr.value(),"max_depth":self.lgb_max_depth.value(),
+                "num_leaves":self.lgb_num_leaves.value(),"min_child_samples":self.lgb_min_child_samples.value(),
+                "min_child_weight":self.lgb_min_child_weight.value(),"min_split_gain":self.lgb_min_split_gain.value(),
+                "subsample":self.lgb_subsample.value(),"colsample_bytree":self.lgb_colsample.value(),
+                "reg_lambda":self.lgb_reg_lambda.value(),"is_unbalance":self.lgb_unbalance.isChecked()}
+
+    # ---- actions ----
+    def on_load_json(self):
+        path,_=QtWidgets.QFileDialog.getOpenFileName(self,"style.json を選択","","JSON (*.json)")
+        if not path: return
+        try:
+            self.styles=load_styles_from_json(path, base_dir=os.path.dirname(path))
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self,"読み込み失敗",str(e)); return
+        self.lbl_json_path.setText(path); self.cmb_style.clear(); self.cmb_style.addItems(list(self.styles.keys()))
+        self.log(f"style.json 読込: {len(self.styles)} スタイル")
+
+    def on_train(self):
+        if not self.styles: QtWidgets.QMessageBox.warning(self,"注意","先に style.json を読み込んでください。"); return
+        self.palette_extractor.num_colors=self.spin_colors.value()
+        self.palette_extractor.auto_k=self.chk_auto_k.isChecked()
+        self.palette_extractor.resize_wh=(self.spin_w.value(), self.spin_h.value())
+        self.palette_extractor.max_samples=self.spin_maxs.value()
+        ui_w=self.get_harmony_weights()
+        self.harmony_evaluator=HarmonyEvaluator(weights=ui_w)
+        self.feature_builder=FeatureBuilder(self.palette_extractor, self.harmony_evaluator)
+        use_lgb=self.cmb_model.currentText().startswith("LightGBM") and _HAS_LGB
+        model_type='lgbm' if use_lgb else 'rf'
+        rf_params=self.get_rf_params(); lgbm_params=self.get_lgbm_params() if use_lgb else None
+        auto_learn=self.chk_auto_weight.isChecked()
+
+        prog=QtWidgets.QProgressDialog("学習中…","キャンセル",0,0,self); prog.setWindowModality(Qt.WindowModality.ApplicationModal); prog.setMinimumDuration(0); prog.show()
+        self._cancel_requested=False; prog.canceled.connect(lambda: self._set_cancel())
+        def canceled(): return self._cancel_requested
+        self._train_thread=QThread(self)
+        worker=TrainWorkerWithParams(self.styles,self.feature_builder,model_type,rf_params,lgbm_params,canceled,auto_learn,ui_w)
+        worker.moveToThread(self._train_thread)
+        worker.progressed.connect(self.log)
+        worker.failed.connect(lambda m:self._finish_thread(self._train_thread,prog,err=m))
+        worker.finished.connect(lambda models,protos:self._finish_train(worker,self._train_thread,prog,models,protos))
+        self._train_thread.started.connect(worker.run); self._train_thread.start()
+
+    def _set_cancel(self): self._cancel_requested=True; self.log("キャンセル要求…")
+    def _finish_thread(self,thread,prog,err=None):
+        prog.close(); thread.quit(); thread.wait()
+        if err: QtWidgets.QMessageBox.critical(self,"エラー",err)
+    def _finish_train(self,worker,thread,prog,models,protos):
+        self._finish_thread(thread,prog); self.models=models; self.protos=protos; self.log("学習完了。")
+
+    def on_pick_eval(self):
+        folder=QtWidgets.QFileDialog.getExistingDirectory(self,"評価フォルダを選択")
+        if not folder: return
+        self.eval_folder=folder; self.lbl_eval.setText(folder); self.log(f"評価フォルダ: {folder}")
+        self.eval_image_index={}
+        for root,_,files in os.walk(folder):
+            for fn in files:
+                low=fn.lower()
+                if any(low.endswith(e) for e in _VALID_IMG_EXTS):
+                    self.eval_image_index[fn]=os.path.join(root,fn)
+
+    def on_evaluate(self):
+        if not self.models: QtWidgets.QMessageBox.warning(self,"注意","先にモデル学習を行ってください。"); return
+        if not self.eval_folder: QtWidgets.QMessageBox.warning(self,"注意","評価フォルダを選択してください。"); return
+        ui_w=self.get_harmony_weights()
+        prog=QtWidgets.QProgressDialog("評価中…","キャンセル",0,0,self); prog.setWindowModality(Qt.WindowModality.ApplicationModal); prog.setMinimumDuration(0); prog.show()
+        self._cancel_requested=False; prog.canceled.connect(lambda: self._set_cancel())
+        def canceled(): return self._cancel_requested
+        self._eval_thread=QThread(self)
+        worker=EvaluateWorker(self.models,self.feature_builder,self.eval_folder,canceled,ui_w)
+        worker.moveToThread(self._eval_thread)
+        worker.progressed.connect(self.log)
+        worker.failed.connect(lambda m:self._finish_thread(self._eval_thread,prog,err=m))
+        worker.finished.connect(lambda per_style,overview:self._finish_eval(worker,self._eval_thread,prog,per_style,overview))
+        self._eval_thread.started.connect(worker.run); self._eval_thread.start()
+
+    def _finish_eval(self,worker,thread,prog,per_style,overview):
+        self._finish_thread(thread,prog)
+        self.per_style_results=per_style; self.overview_df=overview; self.update_overview_table()
+        names=set()
+        for df in self.per_style_results.values(): names.update(df["Image_Name"].tolist())
+        self.list_images.clear()
+        for n in sorted(names): self.list_images.addItem(n)
+        self.log("評価完了。画像を選ぶと詳細が表示されます。")
+
+    def update_overview_table(self):
+        df=self.overview_df.copy()
+        if df is None or df.empty:
+            self.tbl_overview.clear(); self.tbl_overview.setRowCount(0); self.tbl_overview.setColumnCount(0); return
+        self.tbl_overview.setRowCount(len(df)); self.tbl_overview.setColumnCount(len(df.columns))
+        self.tbl_overview.setHorizontalHeaderLabels(df.columns.tolist())
+        for i in range(len(df)):
+            for j,col in enumerate(df.columns):
+                it=QtWidgets.QTableWidgetItem(str(df.iloc[i,j]))
+                if j>0: it.setTextAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter)
+                self.tbl_overview.setItem(i,j,it)
+        self.tbl_overview.resizeColumnsToContents()
+
+    def on_style_changed(self): self.on_image_selected()
+
+    def on_image_selected(self):
+        items=self.list_images.selectedItems()
+        if not items: return
+        img_name=items[0].text()
+        style=self.cmb_style.currentText()
+        if not style or style not in self.per_style_results: return
+        df=self.per_style_results[style]; row=df[df["Image_Name"]==img_name]
+        if row.empty:
+            self.txt_report.setPlainText("この画像は選択スタイルで未評価です。"); self._clear_preview(); return
+        r=row.iloc[0]
+
+        report=r["AnalysisText"]
+        proto=self.protos.get(style, None)
+        if proto is not None:
+            suggest=build_recommendation(r, proto)
+            report = report + "\n\n" + "――――――――――――――――――――\n" + f"【{style} に近づける提案サマリー】\n" + suggest
+        self.txt_report.setPlainText(report)
+
+        harm_labels=["Complementary","Analogous","Monochromatic","SplitComplementary","Triadic","WeightedOverall"]
+        harm_vals=[r[f"Gap_{k}"] for k in harm_labels]
+        draw_signed_bar(self.canvas_harmony,harm_labels,harm_vals,
+                        title=f"[{style}] Harmony gaps — {img_name}",
+                        xlabel="Gap vs typical mean (unitless ~0..1)")
+        color_labels=["Dom_H","Dom_S","Dom_V","Dom_Ratio","Mean_H","Mean_S","Mean_V"]
+        color_vals=[r[f"Gap_{k}"] for k in color_labels]
+        draw_signed_bar(self.canvas_color,color_labels,color_vals,
+                        title=f"[{style}] Color stats gaps — {img_name}\n(H:0–179, S/V:0–255, Ratio:0–1)",
+                        xlabel="Gap vs typical mean (mixed units)")
+
+        self._show_selected_image_preview(img_name)
+
+    # ---- Palette rendering ----
+    def _clear_palette(self):
+        for lay in (self.palette_colors_row, self.palette_ratios_row):
+            while lay.count():
+                item=lay.takeAt(0); w=item.widget()
+                if w: w.setParent(None)
+
+    def _render_palette(self, palette_rgb, ratios):
+        self._clear_palette()
+        for rgb in palette_rgb:
+            chip=QtWidgets.QLabel()
+            chip.setFixedSize(46,24)
+            chip.setStyleSheet(f"background-color: rgb({rgb[0]},{rgb[1]},{rgb[2]}); border:1px solid #444;")
+            self.palette_colors_row.addWidget(chip)
+        self.palette_colors_row.addStretch(1)
+        for r in ratios:
+            lab=QtWidgets.QLabel(f"{r*100:.1f}%")
+            lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lab.setFixedWidth(46)
+            self.palette_ratios_row.addWidget(lab)
+        self.palette_ratios_row.addStretch(1)
+
+    # ---- Preview control ----
+    def _update_preview_ui_state(self):
+        fit = self._img_fit
+        self.zoom_slider.setEnabled(not fit)
+        self.btn_zoom_100.setEnabled(not fit)
+        self.lbl_zoom.setEnabled(not fit)
+
+    def _on_toggle_fit(self,on:bool):
+        self._img_fit=bool(on); self._update_preview_ui_state(); self._refresh_scaled_pixmap()
+
+    def _clear_preview(self,msg:str|None=None):
+        self._img_pixmap_orig=None; self.img_label.setPixmap(QtGui.QPixmap()); self.img_label.setText(msg or "（ここに評価対象の画像プレビュー）")
+        self._clear_palette()
+        self.lbl_zoom.setText(f"{int(self._img_zoom*100)}%")
+
+    def _on_zoom_slider(self,value:int):
+        self._img_zoom=max(0.1,value/100.0); self.lbl_zoom.setText(f"{int(round(self._img_zoom*100))}%")
+        if not self._img_fit: self._refresh_scaled_pixmap()
+
+    def _refresh_scaled_pixmap(self):
+        if self._img_pixmap_orig is None or self._img_pixmap_orig.isNull(): return
+        orig=self._img_pixmap_orig
+        if self._img_fit:
+            w=max(1,self.img_scroll.viewport().width()-4); h=max(1,self.img_scroll.viewport().height()-4)
+            scaled=orig.scaled(w,h,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation)
+        else:
+            tw=max(1,int(orig.width()*self._img_zoom)); th=max(1,int(orig.height()*self._img_zoom))
+            scaled=orig.scaled(tw,th,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation)
+        self.img_label.setPixmap(scaled); self.img_label.setToolTip(self._current_image_path or "")
+        if self._popout and self._popout.isVisible():
+            self._popout.set_pixmap(orig, self._current_image_path)
+
+    def _show_selected_image_preview(self, image_name:str):
+        try:
+            path=None; self._current_image_path=""
+            if self.eval_image_index:
+                path=self.eval_image_index.get(image_name)
+                if path is None:
+                    stem=os.path.splitext(image_name)[0].lower()
+                    for k,v in self.eval_image_index.items():
+                        if os.path.splitext(k)[0].lower()==stem: path=v; break
+            if path and os.path.exists(path):
+                pix=QtGui.QPixmap(path)
+                if not pix.isNull():
+                    self._current_image_path=path; self._img_pixmap_orig=pix; self._refresh_scaled_pixmap()
+                    res=self.palette_extractor.extract_palette_from_image(path)
+                    self._render_palette(res['palette_rgb'], res['palette_df']['Ratio'].tolist())
+                    if self._popout and self._popout.isVisible(): self._popout.set_pixmap(pix, path)
+                    return
+            self._clear_preview("画像が見つかりませんでした。")
+        except Exception as e:
+            self._clear_preview(f"画像の読み込みでエラー: {e}")
+
+    def resizeEvent(self,e:QtGui.QResizeEvent):
+        super().resizeEvent(e)
+        if self._img_pixmap_orig is not None and self._img_fit: self._refresh_scaled_pixmap()
+
+    def on_popout(self):
+        if self._popout is None: self._popout=PreviewWindow(self)
+        if self._img_pixmap_orig and not self._img_pixmap_orig.isNull():
+            self._popout.set_pixmap(self._img_pixmap_orig, self._current_image_path)
+        self._popout.show(); self._popout.raise_(); self._popout.activateWindow()
+
+    def on_save_png(self):
+        items=self.list_images.selectedItems()
+        if not items: QtWidgets.QMessageBox.information(self,"情報","先に画像を選択してください。"); return
+        img_name=items[0].text(); style=self.cmb_style.currentText()
+        if not style or style not in self.per_style_results:
+            QtWidgets.QMessageBox.information(self,"情報","先にスタイルを選択してください。"); return
+        out_dir=QtWidgets.QFileDialog.getExistingDirectory(self,"保存先フォルダを選択")
+        if not out_dir: return
+        harm=os.path.join(out_dir,f"{style}__{os.path.splitext(img_name)[0]}__gaps_harmony.png")
+        self.canvas_harmony.figure.savefig(harm,dpi=160,bbox_inches='tight')
+        col=os.path.join(out_dir,f"{style}__{os.path.splitext(img_name)[0]}__gaps_colorstats.png")
+        self.canvas_color.figure.savefig(col,dpi=160,bbox_inches='tight')
+        self.log(f"保存: {harm}\n保存: {col}")
+
+# ---- main ----
+def main():
+    app=QtWidgets.QApplication(sys.argv)
+    font=app.font(); font.setPointSize(10); app.setFont(font)
+    win=MainWindow(); win.show()
+    sys.exit(app.exec())
+
+if __name__=="__main__":
+    main()
+

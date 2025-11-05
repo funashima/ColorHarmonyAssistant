@@ -1,0 +1,5 @@
+{
+  "japanese_style": { "positive": "typical_rooms/japanese", "negative": "untypical_rooms/no_style" },
+  "nordic_style":   { "positive": "typical_rooms/nordic",   "negative": "untypical_rooms/no_style" },
+  "ethnic_style":   { "positive": "typical_rooms/ethnic",   "negative": "untypical_rooms/no_style" }
+}
