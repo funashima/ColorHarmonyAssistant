@@ -1,0 +1,14 @@
+2026-01-03 07:11:03 [INFO] 開始ディレクトリ: /home/funa/ktc/ColorHarmonyAssistant
+2026-01-03 07:11:03 [INFO] recursive: False, dry-run: True
+2026-01-03 07:11:03 [INFO] === Repository: /home/funa/ktc/ColorHarmonyAssistant ===
+2026-01-03 07:11:03 [INFO]   current origin URL: https://github.com/funashima/ColorHarmonyAssistant.git
+2026-01-03 07:11:03 [INFO]   new origin URL:     git@github.com:funashima/ColorHarmonyAssistant.git
+2026-01-03 07:11:03 [INFO]   --dry-run のため、git remote set-url は実行しません。
+2026-01-03 07:11:03 [INFO] すべての処理が終了しました。
+2026-01-03 07:11:24 [INFO] 開始ディレクトリ: /home/funa/ktc/ColorHarmonyAssistant
+2026-01-03 07:11:24 [INFO] recursive: False, dry-run: False
+2026-01-03 07:11:24 [INFO] === Repository: /home/funa/ktc/ColorHarmonyAssistant ===
+2026-01-03 07:11:24 [INFO]   current origin URL: https://github.com/funashima/ColorHarmonyAssistant.git
+2026-01-03 07:11:24 [INFO]   new origin URL:     git@github.com:funashima/ColorHarmonyAssistant.git
+2026-01-03 07:11:24 [INFO]   [DONE] git remote set-url origin を実行しました。
+2026-01-03 07:11:24 [INFO] すべての処理が終了しました。
